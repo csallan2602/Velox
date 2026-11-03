@@ -1,0 +1,6 @@
+{
+  "name": "Velox Bicycle Rental Platform",
+  "description": "Smart web-based bicycle rental management platform with real-time fleet catalog, instant reservations, operator counter, maintenance tracking, and 3D eco-telemetry.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
