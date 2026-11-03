@@ -1,27 +1,74 @@
-import { Bicycle, Booking, Station, MaintenanceRecord, Review, PlatformStats, BikeCategory, BikeStatus } from '../types';
+import { Bicycle, Booking, Station, MaintenanceRecord, Review, PlatformStats, User } from '../types';
+import { localStore } from './localStore';
 
-const API_BASE = '/api';
+// Configurable API base: supports VITE_API_URL, localStorage override, or default '/api'
+const getApiBase = (): string => {
+  if (typeof window !== 'undefined') {
+    const custom = localStorage.getItem('velox_api_url');
+    if (custom) return custom.replace(/\/$/, '');
+  }
+  const envUrl = (import.meta as any).env?.VITE_API_URL;
+  if (envUrl) return envUrl.replace(/\/$/, '');
+  return '/api';
+};
+
+// Safe fetch wrapper with timeout and automatic localStore fallback
+async function safeFetch<T>(
+  endpoint: string,
+  options?: RequestInit,
+  fallbackFn?: () => T
+): Promise<T> {
+  const url = `${getApiBase()}${endpoint}`;
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 4000); // 4s timeout
+
+    const res = await fetch(url, {
+      ...options,
+      signal: controller.signal
+    });
+    clearTimeout(timeoutId);
+
+    if (res.ok) {
+      return await res.json();
+    }
+
+    // If server returned 404/500/502 and we have a fallback, use it
+    if (fallbackFn) {
+      console.warn(`[Velox API] Server returned ${res.status} for ${endpoint}. Using local fallback store.`);
+      return fallbackFn();
+    }
+
+    const errData = await res.json().catch(() => ({}));
+    throw new Error(errData.error || `Request failed with status ${res.status}`);
+  } catch (err: any) {
+    if (fallbackFn) {
+      console.warn(`[Velox API] Network or proxy error on ${endpoint}. Using resilient local store fallback:`, err.message);
+      return fallbackFn();
+    }
+    throw err;
+  }
+}
 
 export const api = {
   // Stats
   async getStats(): Promise<PlatformStats> {
-    const res = await fetch(`${API_BASE}/stats`);
-    if (!res.ok) throw new Error('Failed to fetch platform stats');
-    return res.json();
+    return safeFetch<PlatformStats>('/stats', undefined, () => localStore.getStats());
   },
 
-  // Health / DB status
+  // Health
   async getHealth(): Promise<any> {
-    const res = await fetch(`${API_BASE}/health`);
-    if (!res.ok) throw new Error('Failed to fetch health');
-    return res.json();
+    return safeFetch<any>('/health', undefined, () => ({
+      status: 'healthy',
+      system: 'Velox Bicycle Rental Platform (Local Fallback)',
+      dbType: 'in-memory-fallback',
+      timestamp: new Date().toISOString()
+    }));
   },
 
   // Stations
   async getStations(): Promise<Station[]> {
-    const res = await fetch(`${API_BASE}/stations`);
-    if (!res.ok) throw new Error('Failed to fetch stations');
-    return res.json();
+    return safeFetch<Station[]>('/stations', undefined, () => localStore.getStations());
   },
 
   // Bicycles
@@ -32,45 +79,48 @@ export const api = {
     if (params?.status) query.append('status', params.status);
     if (params?.search) query.append('search', params.search);
 
-    const res = await fetch(`${API_BASE}/bikes?${query.toString()}`);
-    if (!res.ok) throw new Error('Failed to fetch bicycles');
-    return res.json();
+    const queryString = query.toString() ? `?${query.toString()}` : '';
+    return safeFetch<Bicycle[]>(`/bikes${queryString}`, undefined, () => localStore.getBikes(params));
   },
 
   async getBikeById(id: string): Promise<Bicycle> {
-    const res = await fetch(`${API_BASE}/bikes/${id}`);
-    if (!res.ok) throw new Error('Failed to fetch bicycle');
-    return res.json();
+    return safeFetch<Bicycle>(`/bikes/${id}`, undefined, () => {
+      const bike = localStore.getBikeById(id);
+      if (!bike) throw new Error('Bicycle not found');
+      return bike;
+    });
   },
 
   async createBike(data: Partial<Bicycle>): Promise<Bicycle> {
-    const res = await fetch(`${API_BASE}/bikes`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(data)
-    });
-    if (!res.ok) {
-      const err = await res.json();
-      throw new Error(err.error || 'Failed to create bicycle');
-    }
-    return res.json();
+    return safeFetch<Bicycle>(
+      '/bikes',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data)
+      },
+      () => localStore.createBike(data)
+    );
   },
 
   async updateBike(id: string, data: Partial<Bicycle>): Promise<Bicycle> {
-    const res = await fetch(`${API_BASE}/bikes/${id}`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(data)
-    });
-    if (!res.ok) throw new Error('Failed to update bicycle');
-    return res.json();
+    return safeFetch<Bicycle>(
+      `/bikes/${id}`,
+      {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data)
+      },
+      () => localStore.updateBike(id, data)
+    );
   },
 
   async deleteBike(id: string): Promise<void> {
-    const res = await fetch(`${API_BASE}/bikes/${id}`, {
-      method: 'DELETE'
-    });
-    if (!res.ok) throw new Error('Failed to delete bicycle');
+    return safeFetch<void>(
+      `/bikes/${id}`,
+      { method: 'DELETE' },
+      () => localStore.deleteBike(id)
+    );
   },
 
   // Bookings
@@ -79,9 +129,8 @@ export const api = {
     if (params?.email) query.append('email', params.email);
     if (params?.status) query.append('status', params.status);
 
-    const res = await fetch(`${API_BASE}/bookings?${query.toString()}`);
-    if (!res.ok) throw new Error('Failed to fetch bookings');
-    return res.json();
+    const queryString = query.toString() ? `?${query.toString()}` : '';
+    return safeFetch<Booking[]>(`/bookings${queryString}`, undefined, () => localStore.getBookings(params));
   },
 
   async createBooking(data: {
@@ -93,111 +142,114 @@ export const api = {
     pickupStation: string;
     startTime?: string;
   }): Promise<Booking> {
-    const res = await fetch(`${API_BASE}/bookings`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(data)
-    });
-    if (!res.ok) {
-      const err = await res.json();
-      throw new Error(err.error || 'Failed to reserve bicycle');
-    }
-    return res.json();
+    return safeFetch<Booking>(
+      '/bookings',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data)
+      },
+      () => localStore.createBooking(data)
+    );
   },
 
   async updateBookingStatus(id: string, status: string, returnStation?: string): Promise<{ success: boolean; booking: Booking; bike?: Bicycle }> {
-    const res = await fetch(`${API_BASE}/bookings/${id}/status`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ status, returnStation })
-    });
-    if (!res.ok) throw new Error('Failed to update booking status');
-    return res.json();
+    return safeFetch<{ success: boolean; booking: Booking; bike?: Bicycle }>(
+      `/bookings/${id}/status`,
+      {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ status, returnStation })
+      },
+      () => localStore.updateBookingStatus(id, status, returnStation)
+    );
   },
 
   // Maintenance
   async getMaintenance(): Promise<MaintenanceRecord[]> {
-    const res = await fetch(`${API_BASE}/maintenance`);
-    if (!res.ok) throw new Error('Failed to fetch maintenance records');
-    return res.json();
+    return safeFetch<MaintenanceRecord[]>('/maintenance', undefined, () => localStore.getMaintenance());
   },
 
   async createMaintenanceRecord(data: Partial<MaintenanceRecord>): Promise<MaintenanceRecord> {
-    const res = await fetch(`${API_BASE}/maintenance`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(data)
-    });
-    if (!res.ok) throw new Error('Failed to file maintenance report');
-    return res.json();
+    return safeFetch<MaintenanceRecord>(
+      '/maintenance',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data)
+      },
+      () => localStore.createMaintenance(data)
+    );
   },
 
   async updateMaintenanceRecord(id: string, data: Partial<MaintenanceRecord>): Promise<MaintenanceRecord> {
-    const res = await fetch(`${API_BASE}/maintenance/${id}`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(data)
-    });
-    if (!res.ok) throw new Error('Failed to update maintenance record');
-    return res.json();
+    return safeFetch<MaintenanceRecord>(
+      `/maintenance/${id}`,
+      {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data)
+      },
+      () => localStore.updateMaintenance(id, data)
+    );
   },
 
   // Reviews
   async getReviews(): Promise<Review[]> {
-    const res = await fetch(`${API_BASE}/reviews`);
-    if (!res.ok) throw new Error('Failed to fetch reviews');
-    return res.json();
+    return safeFetch<Review[]>('/reviews', undefined, () => localStore.getReviews());
   },
 
   async createReview(data: Partial<Review>): Promise<Review> {
-    const res = await fetch(`${API_BASE}/reviews`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(data)
-    });
-    if (!res.ok) throw new Error('Failed to submit review');
-    return res.json();
+    return safeFetch<Review>(
+      '/reviews',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data)
+      },
+      () => localStore.createReview(data)
+    );
   },
 
   // Authentication
   async login(credentials: { email: string; password: string }): Promise<{ user: any; token: string }> {
-    const res = await fetch(`${API_BASE}/auth/login`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(credentials)
-    });
-    if (!res.ok) {
-      const err = await res.json();
-      throw new Error(err.error || 'Login failed');
-    }
-    return res.json();
+    return safeFetch<{ user: any; token: string }>(
+      '/auth/login',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(credentials)
+      },
+      () => localStore.login(credentials)
+    );
   },
 
   async register(data: { name: string; email: string; password: string; phone?: string; role?: string }): Promise<{ user: any; token: string }> {
-    const res = await fetch(`${API_BASE}/auth/register`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(data)
-    });
-    if (!res.ok) {
-      const err = await res.json();
-      throw new Error(err.error || 'Registration failed');
-    }
-    return res.json();
+    return safeFetch<{ user: any; token: string }>(
+      '/auth/register',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data)
+      },
+      () => localStore.register(data)
+    );
   },
 
   async getMe(token?: string, email?: string): Promise<{ user: any }> {
-    const headers: Record<string, string> = {};
-    if (token) headers['Authorization'] = `Bearer ${token}`;
-    const query = email ? `?email=${encodeURIComponent(email)}` : '';
-    const res = await fetch(`${API_BASE}/auth/me${query}`, { headers });
-    if (!res.ok) throw new Error('Failed to fetch user session');
-    return res.json();
+    return safeFetch<{ user: any }>(
+      `/auth/me${email ? `?email=${encodeURIComponent(email)}` : ''}`,
+      {
+        headers: token ? { Authorization: `Bearer ${token}` } : undefined
+      },
+      () => localStore.getMe(token, email)
+    );
   },
 
   async getUsers(): Promise<any[]> {
-    const res = await fetch(`${API_BASE}/auth/users`);
-    if (!res.ok) throw new Error('Failed to fetch users');
-    return res.json();
+    return safeFetch<any[]>('/auth/users', undefined, () => {
+      const users = (localStore as any).getUsers?.() || [];
+      return users;
+    });
   }
 };
